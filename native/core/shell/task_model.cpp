@@ -1421,7 +1421,20 @@ struct TaskModel::Impl {
         PostMessageW(ui, readyMsg, 0, 0);
     }
 
-    void RunIconJob(const Job& job)
+// Windows 11 shows unplated icons in its own taskbar and Start, so the shell already hands back
+// the right icon there; Windows 10 hands back a Store tile, which the manifest pipeline replaces.
+bool WindowsEleven()
+{
+    static const bool eleven = [] {
+        using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+        OSVERSIONINFOW v{sizeof(v)};
+        auto get = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+        return get && get(&v) == 0 && v.dwBuildNumber >= 22000;
+    }();
+    return eleven;
+}
+
+void RunIconJob(const Job& job)
     {
         std::vector<std::wstring> sources;
         auto add = [&](std::wstring s) {
@@ -1442,12 +1455,12 @@ struct TaskModel::Impl {
         std::wstring linkTarget, linkAumid;
         if (aumid.empty() && IsLink(job.pinPath) && ReadLink(job.pinPath, linkTarget, linkAumid))
             aumid = linkAumid; // a pinned Store app's shortcut carries its AUMID
-        if (!ok)
+        if (!ok && !WindowsEleven())
             ok = LoadPackagedIcon(aumid, job.exePath, job.size, img);
         for (size_t i = 0; !ok && i < sources.size(); ++i) {
             ok = LoadShellImage(sources[i], job.size, img);
-            // The Apps folder hands back a Store tile: a glyph on a solid colour plate.
-            if (ok && sources[i].compare(0, 16, L"shell:AppsFolder") == 0) {
+            // The Apps folder hands back a Store tile on Windows 10: a glyph on a solid colour plate.
+            if (ok && !WindowsEleven() && sources[i].compare(0, 16, L"shell:AppsFolder") == 0) {
                 Unplate(img);
                 img = FitToSquare(TrimInk(img), job.size);
             }
