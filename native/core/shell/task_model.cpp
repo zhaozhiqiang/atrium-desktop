@@ -1943,6 +1943,50 @@ std::wstring PackageRoot(const std::wstring& exe)
     return {};
 }
 
+// WindowsApps refuses enumeration even when its packages can be opened by name, so the folder is
+// read from the per-user package repository, which records every installed package's root.
+std::wstring PackageRootFromRepository(const std::wstring& family)
+{
+    const wchar_t* key = L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\"
+                         L"CurrentVersion\\AppModel\\Repository\\Packages";
+    HKEY root = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, key, 0, KEY_READ, &root) != ERROR_SUCCESS)
+        return {};
+    // The key is the package full name, <identity>_<version>_<arch>__<publisher hash>, while the
+    // family is <identity>_<publisher hash>: the identity opens the match, the hash closes it.
+    const size_t cut = family.find_last_of(L'_');
+    if (cut == std::wstring::npos)
+        return {};
+    const std::wstring identity = family.substr(0, cut) + L"_";
+    const std::wstring hash = family.substr(cut); // "_" + the 13 characters
+    std::wstring found;
+    for (DWORD i = 0; found.empty(); ++i) {
+        wchar_t name[256]{};
+        DWORD len = DWORD(std::size(name));
+        if (RegEnumKeyExW(root, i, name, &len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+            break;
+        if (len <= identity.size() + hash.size() || _wcsnicmp(name, identity.c_str(), identity.size()) != 0)
+            continue;
+        std::wstring tail(name + (len - hash.size()), hash.size());
+        if (_wcsicmp(tail.c_str(), hash.c_str()) != 0)
+            continue;
+        HKEY sub = nullptr;
+        if (RegOpenKeyExW(root, name, 0, KEY_READ, &sub) != ERROR_SUCCESS)
+            continue;
+        wchar_t path[512]{};
+        DWORD bytes = DWORD(sizeof(path));
+        DWORD type = 0;
+        if (RegQueryValueExW(sub, L"PackageRootFolder", nullptr, &type, reinterpret_cast<LPBYTE>(path), &bytes)
+                == ERROR_SUCCESS &&
+            (type == REG_SZ || type == REG_EXPAND_SZ) && bytes > sizeof(wchar_t) &&
+            GetFileAttributesW((std::wstring(path) + L"\\AppxManifest.xml").c_str()) != INVALID_FILE_ATTRIBUTES)
+            found = path;
+        RegCloseKey(sub);
+    }
+    RegCloseKey(root);
+    return found;
+}
+
 // The package folder of a family name (the AUMID before the '!'): WindowsApps\<family>_<version>...
 std::wstring PackageRootOfFamily(const std::wstring& family)
 {
@@ -1952,10 +1996,15 @@ std::wstring PackageRootOfFamily(const std::wstring& family)
     const size_t hash = family.find_last_of(L'_');
     if (hash == std::wstring::npos || family.size() - hash - 1 != 13)
         return {};
+    // An inbox app sits in C:\Windows; a store app is named by the per-user package repository.
+    auto fallback = [&]() {
+        std::wstring inbox = PackageRootInWindows(family);
+        return inbox.empty() ? PackageRootFromRepository(family) : inbox;
+    };
     WIN32_FIND_DATAW data{};
     HANDLE find = FindFirstFileW((L"C:\\Program Files\\WindowsApps\\" + family + L"_*").c_str(), &data);
     if (find == INVALID_HANDLE_VALUE)
-        return PackageRootInWindows(family);
+        return fallback(); // WindowsApps refused the listing: the repository still knows every root
     std::wstring root;
     do {
         if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
@@ -1969,7 +2018,7 @@ std::wstring PackageRootOfFamily(const std::wstring& family)
     FindClose(find);
     if (!root.empty())
         return root;
-    return PackageRootInWindows(family);
+    return fallback();
 }
 
 std::string LowerAscii(std::string s)
@@ -2228,6 +2277,10 @@ void Unplate(IconImage& img)
 bool LoadPackagedIcon(const std::wstring& aumid, const std::wstring& exePath, int sizePx, IconImage& out)
 {
     std::wstring root = PackageRoot(exePath);
+    // A packaged app started by its alias sits in AppData\Local\Microsoft\WindowsApps, which is not
+    // the package folder: only a root that carries a manifest counts.
+    if (!root.empty() && GetFileAttributesW((root + L"\\AppxManifest.xml").c_str()) == INVALID_FILE_ATTRIBUTES)
+        root.clear();
     if (root.empty() && !aumid.empty()) {
         const size_t bang = aumid.find(L'!');
         root = PackageRootOfFamily(bang == std::wstring::npos ? aumid : aumid.substr(0, bang));
