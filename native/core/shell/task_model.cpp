@@ -22,12 +22,14 @@
 #include <propsys.h>
 #include <propkey.h>
 #include <propvarutil.h>
+#include <wincodec.h>
 
 #include <winrt/base.h>
 
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -591,6 +593,38 @@ IconImage FitToSquare(const IconImage& src, int size)
     return out;
 }
 
+// Crops the transparent margin around a glyph. Settings' gear fills only 32 of its 44 pixels, so
+// drawn as-is it looks tiny beside a full-bleed icon like Terminal's; cropping lets it fill the
+// slot the way Windows' own taskbar shows it.
+IconImage TrimInk(const IconImage& src)
+{
+    const int w = src.width, h = src.height;
+    if (w < 2 || h < 2 || src.bgra.size() != size_t(w) * size_t(h) * 4)
+        return src;
+    int x0 = w, y0 = h, x1 = -1, y1 = -1;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            if (src.bgra[(size_t(y) * size_t(w) + size_t(x)) * 4 + 3] < 8)
+                continue;
+            x0 = std::min(x0, x);
+            x1 = std::max(x1, x);
+            y0 = std::min(y0, y);
+            y1 = std::max(y1, y);
+        }
+    }
+    if (x1 < 0 || (x1 - x0 + 1 == w && y1 - y0 + 1 == h))
+        return src;
+    IconImage out;
+    out.width = x1 - x0 + 1;
+    out.height = y1 - y0 + 1;
+    out.bgra.resize(size_t(out.width) * size_t(out.height) * 4, 0);
+    for (int y = 0; y < out.height; ++y)
+        std::memcpy(&out.bgra[size_t(y) * size_t(out.width) * 4],
+                    &src.bgra[(size_t(y + y0) * size_t(w) + size_t(x0)) * 4],
+                    size_t(out.width) * 4);
+    return out;
+}
+
 // IShellItemImageFactory on a parsing name (path, .lnk or shell:AppsFolder\...).
 bool ShellImage(const std::wstring& parsingName, int size, IconImage& out, bool thumbnail = false)
 {
@@ -735,6 +769,10 @@ struct ScanRec {
 };
 
 } // namespace
+
+bool LoadPackagedIcon(const std::wstring& aumid, const std::wstring& exePath, int sizePx, IconImage& out);
+bool LoadShellImage(const std::wstring& parsingName, int sizePx, IconImage& out, bool thumbnail);
+void Unplate(IconImage& img);
 
 bool HIconToImage(HICON icon, IconImage& out)
 {
@@ -1400,8 +1438,20 @@ struct TaskModel::Impl {
         LARGE_INTEGER t0, t1, f;
         QueryPerformanceCounter(&t0);
         ok = LoadAtriumIcon(job.exePath, job.size, img);
-        for (size_t i = 0; !ok && i < sources.size(); ++i)
+        std::wstring aumid = job.aumid;
+        std::wstring linkTarget, linkAumid;
+        if (aumid.empty() && IsLink(job.pinPath) && ReadLink(job.pinPath, linkTarget, linkAumid))
+            aumid = linkAumid; // a pinned Store app's shortcut carries its AUMID
+        if (!ok)
+            ok = LoadPackagedIcon(aumid, job.exePath, job.size, img);
+        for (size_t i = 0; !ok && i < sources.size(); ++i) {
             ok = LoadShellImage(sources[i], job.size, img);
+            // The Apps folder hands back a Store tile: a glyph on a solid colour plate.
+            if (ok && sources[i].compare(0, 16, L"shell:AppsFolder") == 0) {
+                Unplate(img);
+                img = FitToSquare(TrimInk(img), job.size);
+            }
+        }
         for (size_t i = 0; !ok && i < job.hwnds.size(); ++i) {
             IconImage raw;
             if (WindowIcon(job.hwnds[i], job.size, raw)) {
@@ -1809,9 +1859,397 @@ bool LoadAtriumIcon(const std::wstring& exePath, int sizePx, IconImage& out)
     return ok;
 }
 
-bool LoadShellImage(const std::wstring& parsingName, int sizePx, IconImage& out, bool thumbnail)
+// ---- packaged app icons -------------------------------------------------------
+
+std::string LowerAscii(std::string s);
+
+// Inbox apps carry no WindowsApps folder (Settings is C:\Windows\ImmersiveControlPanel), so the
+// folder is found by the identity its manifest declares.
+std::wstring PackageRootInWindows(const std::wstring& family)
 {
-    try {
+    // The family is <identity name>_<publisher hash>.
+    const size_t cut = family.find_last_of(L'_');
+    const std::wstring name = cut == std::wstring::npos ? family : family.substr(0, cut);
+    const std::string needle = LowerAscii("name=\"" + std::string(name.begin(), name.end()) + "\"");
+    auto declares = [&](const std::wstring& dir) {
+        HANDLE file = CreateFileW((dir + L"\\AppxManifest.xml").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            return false;
+        std::string xml(8192, '\0');
+        DWORD got = 0;
+        ReadFile(file, xml.data(), DWORD(xml.size()), &got, nullptr);
+        CloseHandle(file);
+        xml.resize(std::min<size_t>(got, xml.size()));
+        return LowerAscii(xml).find(needle) != std::string::npos;
+    };
+
+    std::wstring root;
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW(L"C:\\Windows\\*", &data);
+    if (find == INVALID_HANDLE_VALUE) {
+        return {};
+    }
+    do {
+        if (!root.empty())
+            break;
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || data.cFileName[0] == L'.')
+            continue;
+        const std::wstring top = L"C:\\Windows\\" + std::wstring(data.cFileName);
+        if (declares(top)) {
+            root = top;
+            continue;
+        }
+        // System apps sit one level down (C:\Windows\SystemApps\<package>).
+        WIN32_FIND_DATAW inner{};
+        HANDLE sub = FindFirstFileW((top + L"\\*").c_str(), &inner);
+        if (sub == INVALID_HANDLE_VALUE)
+            continue;
+        do {
+            if (!(inner.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || inner.cFileName[0] == L'.')
+                continue;
+            const std::wstring candidate = top + L"\\" + std::wstring(inner.cFileName);
+            if (declares(candidate)) {
+                root = candidate;
+                break;
+            }
+        } while (FindNextFileW(sub, &inner));
+        FindClose(sub);
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+    return root;
+}
+
+// The package folder of an executable: <WindowsApps>\<package>\..., or the folder whose
+// AppxManifest.xml sits beside it (an inbox app such as Settings).
+std::wstring PackageRoot(const std::wstring& exe)
+{
+    if (exe.empty())
+        return {};
+    std::wstring lower = exe;
+    CharLowerBuffW(lower.data(), DWORD(lower.size()));
+    const std::wstring marker = L"\\windowsapps\\";
+    if (size_t at = lower.find(marker); at != std::wstring::npos) {
+        const size_t start = at + marker.size();
+        const size_t end = lower.find(L'\\', start);
+        if (end != std::wstring::npos && end > start && end + 1 < exe.size())
+            return exe.substr(0, end);
+    }
+    const size_t slash = exe.find_last_of(L'\\');
+    if (slash != std::wstring::npos) {
+        const std::wstring dir = exe.substr(0, slash);
+        if (GetFileAttributesW((dir + L"\\AppxManifest.xml").c_str()) != INVALID_FILE_ATTRIBUTES)
+            return dir;
+    }
+    return {};
+}
+
+// The package folder of a family name (the AUMID before the '!'): WindowsApps\<family>_<version>...
+std::wstring PackageRootOfFamily(const std::wstring& family)
+{
+    if (family.empty())
+        return {};
+    // Only a package family is worth the search: <identity name>_<13-character publisher hash>.
+    const size_t hash = family.find_last_of(L'_');
+    if (hash == std::wstring::npos || family.size() - hash - 1 != 13)
+        return {};
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW((L"C:\\Program Files\\WindowsApps\\" + family + L"_*").c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE)
+        return PackageRootInWindows(family);
+    std::wstring root;
+    do {
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            continue;
+        std::wstring candidate = L"C:\\Program Files\\WindowsApps\\" + std::wstring(data.cFileName);
+        if (GetFileAttributesW((candidate + L"\\AppxManifest.xml").c_str()) != INVALID_FILE_ATTRIBUTES) {
+            root = std::move(candidate);
+            break;
+        }
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+    if (!root.empty())
+        return root;
+    return PackageRootInWindows(family);
+}
+
+std::string LowerAscii(std::string s)
+{
+    for (char& ch : s)
+        ch = char(tolower(static_cast<unsigned char>(ch)));
+    return s;
+}
+
+// A value of an XML attribute in a single tag; the tag's case is kept, the name is compared
+// case-insensitively (manifests write Square44x44Logo in any case).
+std::string ManifestAttr(const std::string& tag, const char* name)
+{
+    const std::string lower = LowerAscii(tag);
+    const size_t at = lower.find(std::string(" ") + name + "=\"");
+    if (at == std::string::npos)
+        return {};
+    const size_t from = at + strlen(name) + 3;
+    const size_t to = tag.find('"', from);
+    return to == std::string::npos ? std::string() : tag.substr(from, to - from);
+}
+
+// Square44x44Logo of the package's first application (the icons' own asset, not the Store tile).
+std::wstring ManifestLogo(const std::wstring& root)
+{
+    std::wstring path = root + L"\\AppxManifest.xml";
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return {};
+    std::string xml(size_t(std::min<DWORD>(GetFileSize(file, nullptr), 1u << 20)), '\0');
+    DWORD got = 0;
+    ReadFile(file, xml.data(), DWORD(xml.size()), &got, nullptr);
+    CloseHandle(file);
+    xml.resize(got);
+    const std::string lower = LowerAscii(xml);
+    for (size_t p = lower.find("visualelements"); p != std::string::npos; p = lower.find("visualelements", p + 1)) {
+        const size_t open = lower.rfind('<', p);
+        const size_t close = lower.find('>', p);
+        if (open == std::string::npos || close == std::string::npos)
+            continue;
+        const std::string tag = xml.substr(open, close - open);
+        std::string logo = ManifestAttr(tag, "square44x44logo");
+        if (logo.empty())
+            logo = ManifestAttr(tag, "logo");
+        if (logo.empty())
+            continue;
+        for (char& ch : logo)
+            if (ch == '/')
+                ch = '\\';
+        return std::wstring(logo.begin(), logo.end());
+    }
+    return {};
+}
+
+// The best file beside `logo` for `px`: targetsize-<n> and scale-<n> variants, the unplated
+// form (no plate behind the glyph, what Windows draws in its taskbar) before the plain one.
+bool BestLogoAsset(const std::wstring& root, const std::wstring& logo, int px, std::wstring& out)
+{
+    const size_t slash = logo.find_last_of(L'\\');
+    const std::wstring dir = root + (slash == std::wstring::npos ? L"" : L"\\" + logo.substr(0, slash));
+    const std::wstring file = slash == std::wstring::npos ? logo : logo.substr(slash + 1);
+    const size_t dot = file.find_last_of(L'.');
+    const std::wstring stem = Lower(dot == std::wstring::npos ? file : file.substr(0, dot));
+    if (stem.empty())
+        return false;
+
+    struct Asset {
+        std::wstring path;
+        int size = 0, unplated = 0;
+    };
+    std::optional<Asset> best;
+    auto consider = [&](const std::wstring& name) {
+        const std::wstring lower = Lower(name);
+        if (lower.size() <= stem.size() || lower.compare(0, stem.size(), stem) != 0)
+            return;
+        const wchar_t next = lower[stem.size()];
+        if (next != L'.' && next != L'_')
+            return;
+        if (lower.find(L"contrast-") != std::wstring::npos) // high-contrast themes
+            return;
+        Asset a;
+        a.path = dir + L"\\" + name;
+        a.unplated = lower.find(L"altform-unplated") != std::wstring::npos ? 2
+                   : lower.find(L"altform-lightunplated") != std::wstring::npos ? 1 : 0;
+        size_t at = lower.find(L"targetsize-");
+        if (at != std::wstring::npos) {
+            a.size = _wtoi(lower.c_str() + at + 11);
+        } else if ((at = lower.find(L"scale-")) != std::wstring::npos) {
+            a.size = _wtoi(lower.c_str() + at + 6) * 44 / 100; // the base asset is 44 DIP
+        } else {
+            a.size = 44;
+        }
+        if (a.size <= 0)
+            return;
+        // Twice the slot is sampled so the glyph stays crisp after cropping and downscaling.
+        const bool fits = a.size >= px * 2;
+        if (best) {
+            const Asset& b = *best;
+            const bool bFits = b.size >= px;
+            if (fits != bFits) {
+                if (!fits)
+                    return;
+            } else if (a.unplated != b.unplated) {
+                if (a.unplated < b.unplated)
+                    return;
+            } else if (fits ? a.size > b.size : a.size < b.size) {
+                return;
+            }
+        }
+        best = std::move(a);
+    };
+
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW((dir + L"\\*").c_str(), &data);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                consider(std::wstring(data.cFileName));
+        } while (FindNextFileW(find, &data));
+        FindClose(find);
+    }
+    const std::wstring whole = dir + L"\\" + file;
+    if (!best && GetFileAttributesW(whole.c_str()) != INVALID_FILE_ATTRIBUTES)
+        best = Asset{whole, 44, 0};
+    if (!best)
+        return false;
+    out = std::move(best->path);
+    return true;
+}
+
+// A PNG as premultiplied BGRA, the layout IconImage uses.
+bool DecodePng(const std::wstring& path, IconImage& out)
+{
+    winrt::com_ptr<IWICImagingFactory> wic;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(wic.put()))) || !wic)
+        return false;
+    winrt::com_ptr<IWICBitmapDecoder> decoder;
+    winrt::com_ptr<IWICBitmapFrameDecode> frame;
+    winrt::com_ptr<IWICFormatConverter> converter;
+    if (FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, decoder.put())) || !decoder ||
+        FAILED(decoder->GetFrame(0, frame.put())) || !frame || FAILED(wic->CreateFormatConverter(converter.put())) || !converter ||
+        FAILED(converter->Initialize(frame.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)))
+        return false;
+    UINT w = 0, h = 0;
+    if (FAILED(converter->GetSize(&w, &h)) || !w || !h || w > 2048 || h > 2048)
+        return false;
+    out.width = int(w);
+    out.height = int(h);
+    out.bgra.assign(size_t(w) * size_t(h) * 4, 0);
+    if (FAILED(converter->CopyPixels(nullptr, w * 4, UINT(out.bgra.size()), out.bgra.data())))
+        return false;
+    return true;
+}
+
+// The Apps folder tile is the glyph on a solid plate (the system accent, usually blue). When no
+// unplated asset exists, key that plate out from the corner colour so the taskbar shows the glyph
+// alone, like Windows' own taskbar does. A transparent or multi-colour corner is left untouched.
+void Unplate(IconImage& img)
+{
+    const int w = img.width, h = img.height;
+    if (w < 8 || h < 8 || img.bgra.size() != size_t(w) * size_t(h) * 4)
+        return;
+
+    auto at = [&](int x, int y) { return img.bgra.data() + (size_t(y) * size_t(w) + size_t(x)) * 4; };
+    auto diff = [](int a, int b) { return a > b ? a - b : b - a; };
+
+    // Plate colour: the four corners, all opaque and agreeing with each other.
+    int pb = 0, pg = 0, pr = 0;
+    const int cx[4] = {1, w - 2, 1, w - 2};
+    const int cy[4] = {1, 1, h - 2, h - 2};
+    for (int i = 0; i < 4; ++i) {
+        const unsigned char* p = at(cx[i], cy[i]);
+        if (p[3] < 250)
+            return; // already transparent behind the glyph
+        pb += p[0];
+        pg += p[1];
+        pr += p[2];
+    }
+    pb /= 4;
+    pg /= 4;
+    pr /= 4;
+
+    // Distance of a pixel from the plate colour (the largest channel difference).
+    const int fade = 70;
+    auto distance = [&](int x, int y) {
+        const unsigned char* p = at(x, y);
+        return std::max(diff(int(p[0]), pb), std::max(diff(int(p[1]), pg), diff(int(p[2]), pr)));
+    };
+
+    // Flood the plate in from the border: only the background is connected to the edge, so the
+    // glyph keeps its shape even where it touches the border with another colour.
+    std::vector<unsigned char> region(size_t(w) * size_t(h), 0);
+    std::vector<int> pending;
+    auto seed = [&](int x, int y) {
+        const int index = y * w + x;
+        if (!region[index] && distance(x, y) <= fade) {
+            region[index] = 1;
+            pending.push_back(index);
+        }
+    };
+    for (int x = 0; x < w; ++x) {
+        seed(x, 0);
+        seed(x, h - 1);
+    }
+    for (int y = 0; y < h; ++y) {
+        seed(0, y);
+        seed(w - 1, y);
+    }
+    long long filled = 0;
+    while (!pending.empty()) {
+        const int index = pending.back();
+        pending.pop_back();
+        ++filled;
+        const int x = index % w, y = index / w;
+        if (x > 0) seed(x - 1, y);
+        if (x + 1 < w) seed(x + 1, y);
+        if (y > 0) seed(x, y - 1);
+        if (y + 1 < h) seed(x, y + 1);
+    }
+    // A flat single-colour picture would be wiped out; that is artwork, not a plate. And a plate
+    // must leave a glyph behind, or the icon would come back empty.
+    long long visible = 0;
+    for (size_t i = 0; i < region.size(); ++i) {
+        if (!region[i] && img.bgra[i * 4 + 3] >= 64)
+            ++visible;
+    }
+    if (filled == 0 || filled > (long long)w * h * 97 / 100 || visible < (long long)w * h / 100)
+        return;
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            if (!region[y * w + x])
+                continue;
+            const int d = distance(x, y);
+            const int alpha = d <= 20 ? 0 : std::min(255, (d - 20) * 255 / (fade - 20));
+            if (alpha >= 255)
+                continue; // an opaque pixel of the artwork that the flood reached
+            unsigned char* p = at(x, y);
+            const int was = p[3];
+            const int now = was * alpha / 255;
+            if (now <= 0) {
+                p[0] = p[1] = p[2] = p[3] = 0; // premultiplied: transparent means no colour
+            } else {
+                p[0] = (unsigned char)(int(p[0]) * now / was);
+                p[1] = (unsigned char)(int(p[1]) * now / was);
+                p[2] = (unsigned char)(int(p[2]) * now / was);
+                p[3] = (unsigned char)now;
+            }
+        }
+    }
+}
+
+// A packaged app's own icon. The shell hands back the Apps folder tile (a large coloured
+// square for Terminal and Settings); the manifest's Square44x44Logo is the small icon Windows
+// draws on its taskbar.
+bool LoadPackagedIcon(const std::wstring& aumid, const std::wstring& exePath, int sizePx, IconImage& out)
+{
+    std::wstring root = PackageRoot(exePath);
+    if (root.empty() && !aumid.empty()) {
+        const size_t bang = aumid.find(L'!');
+        root = PackageRootOfFamily(bang == std::wstring::npos ? aumid : aumid.substr(0, bang));
+    }
+    if (root.empty())
+        return false;
+    const std::wstring logo = ManifestLogo(root);
+    if (logo.empty())
+        return false;
+    std::wstring asset;
+    if (!BestLogoAsset(root, logo, sizePx, asset))
+        return false;
+    IconImage raw;
+    if (!DecodePng(asset, raw))
+        return false;
+    Unplate(raw);
+    out = FitToSquare(TrimInk(raw), sizePx);
+    return true;
+}
+
+bool LoadShellImage(const std::wstring& parsingName, int sizePx, IconImage& out, bool thumbnail)
+{    try {
         if (!thumbnail) {
             std::wstring source = AppExecutable(parsingName);
             int index = 0;
