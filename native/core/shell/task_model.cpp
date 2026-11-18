@@ -40,6 +40,12 @@
 
 namespace atrium {
 
+// The icon helpers live in the anonymous namespace below; the model that calls them sits further
+// down, and their definitions come after it.
+bool LoadPackagedIcon(const std::wstring& aumid, const std::wstring& exePath, int sizePx, IconImage& out);
+bool LoadShellImage(const std::wstring& parsingName, int sizePx, IconImage& out, bool thumbnail);
+void Unplate(IconImage& img);
+
 namespace {
 
 // Windows 11 hands back the unplated icon in its own taskbar, Start and lists; Windows 10 hands
@@ -632,9 +638,7 @@ IconImage TrimInk(const IconImage& src)
     out.height = y1 - y0 + 1;
     out.bgra.resize(size_t(out.width) * size_t(out.height) * 4, 0);
     for (int y = 0; y < out.height; ++y)
-        std::memcpy(&out.bgra[size_t(y) * size_t(out.width) * 4],
-                    &src.bgra[(size_t(y + y0) * size_t(w) + size_t(x0)) * 4],
-                    size_t(out.width) * 4);
+        std::memcpy(&out.bgra[size_t(y) * size_t(out.width) * 4], &src.bgra[(size_t(y + y0) * size_t(w) + size_t(x0)) * 4], size_t(out.width) * 4);
     return out;
 }
 
@@ -782,10 +786,6 @@ struct ScanRec {
 };
 
 } // namespace
-
-bool LoadPackagedIcon(const std::wstring& aumid, const std::wstring& exePath, int sizePx, IconImage& out);
-bool LoadShellImage(const std::wstring& parsingName, int sizePx, IconImage& out, bool thumbnail);
-void Unplate(IconImage& img);
 
 bool HIconToImage(HICON icon, IconImage& out)
 {
@@ -1434,7 +1434,7 @@ struct TaskModel::Impl {
         PostMessageW(ui, readyMsg, 0, 0);
     }
 
-void RunIconJob(const Job& job)
+    void RunIconJob(const Job& job)
     {
         std::vector<std::wstring> sources;
         auto add = [&](std::wstring s) {
@@ -1989,8 +1989,7 @@ std::wstring PackageRootFromRepository(const std::wstring& family)
         wchar_t path[512]{};
         DWORD bytes = DWORD(sizeof(path));
         DWORD type = 0;
-        if (RegQueryValueExW(sub, L"PackageRootFolder", nullptr, &type, reinterpret_cast<LPBYTE>(path), &bytes)
-                == ERROR_SUCCESS &&
+        if (RegQueryValueExW(sub, L"PackageRootFolder", nullptr, &type, reinterpret_cast<LPBYTE>(path), &bytes) == ERROR_SUCCESS &&
             (type == REG_SZ || type == REG_EXPAND_SZ) && bytes > sizeof(wchar_t) &&
             GetFileAttributesW((std::wstring(path) + L"\\AppxManifest.xml").c_str()) != INVALID_FILE_ATTRIBUTES)
             found = path;
@@ -2114,8 +2113,7 @@ bool BestLogoAsset(const std::wstring& root, const std::wstring& logo, int px, s
             return;
         Asset a;
         a.path = dir + L"\\" + name;
-        a.unplated = lower.find(L"altform-unplated") != std::wstring::npos ? 2
-                   : lower.find(L"altform-lightunplated") != std::wstring::npos ? 1 : 0;
+        a.unplated = lower.find(L"altform-unplated") != std::wstring::npos ? 2 : lower.find(L"altform-lightunplated") != std::wstring::npos ? 1 : 0;
         size_t at = lower.find(L"targetsize-");
         if (at != std::wstring::npos) {
             a.size = _wtoi(lower.c_str() + at + 11);
@@ -2246,10 +2244,14 @@ void Unplate(IconImage& img)
         pending.pop_back();
         ++filled;
         const int x = index % w, y = index / w;
-        if (x > 0) seed(x - 1, y);
-        if (x + 1 < w) seed(x + 1, y);
-        if (y > 0) seed(x, y - 1);
-        if (y + 1 < h) seed(x, y + 1);
+        if (x > 0)
+            seed(x - 1, y);
+        if (x + 1 < w)
+            seed(x + 1, y);
+        if (y > 0)
+            seed(x, y - 1);
+        if (y + 1 < h)
+            seed(x, y + 1);
     }
     // A flat single-colour picture would be wiped out; that is artwork, not a plate. And a plate
     // must leave a glyph behind, or the icon would come back empty.
@@ -2331,7 +2333,8 @@ bool LoadAppIcon(const std::wstring& aumid, int sizePx, IconImage& out)
 }
 
 bool LoadShellImage(const std::wstring& parsingName, int sizePx, IconImage& out, bool thumbnail)
-{    try {
+{
+    try {
         if (!thumbnail) {
             std::wstring source = AppExecutable(parsingName);
             int index = 0;
