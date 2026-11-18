@@ -3,14 +3,19 @@ using System.Net;
 using System.Net.Http;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.WindowsRuntime;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.UI;
+using Microsoft.UI.Composition.SystemBackdrops;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Imaging;
+using Windows.Graphics.Imaging;
+using Windows.Storage.Streams;
 using Windows.UI;
 
 namespace Atrium.Settings;
@@ -18,6 +23,24 @@ namespace Atrium.Settings;
 public sealed partial class MainWindow : Window
 {
     [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr hwnd);
+    // RtlGetVersion, not Environment.OSVersion, which follows the app manifest's compatibility
+    // section. Windows 10 is the only system whose first frame must not run the PNG codec.
+    [DllImport("ntdll.dll", CharSet = CharSet.Unicode)] private static extern int RtlGetVersion(ref OsVersionInfo info);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct OsVersionInfo
+    {
+        public uint Size;
+        public uint Major;
+        public uint Minor;
+        public uint Build;
+        public uint Platform;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string ServicePack;
+    }
+    private static bool RunsWindowsTen()
+    {
+        var info = new OsVersionInfo { Size = (uint)Marshal.SizeOf<OsVersionInfo>() };
+        return RtlGetVersion(ref info) == 0 && info.Build < 22000;
+    }
     private delegate IntPtr SubclassProc(IntPtr hwnd, uint message, UIntPtr wparam, IntPtr lparam, UIntPtr id, UIntPtr data);
     [DllImport("comctl32.dll")] private static extern bool SetWindowSubclass(IntPtr hwnd, SubclassProc proc, UIntPtr id, UIntPtr data);
     [DllImport("comctl32.dll")] private static extern bool RemoveWindowSubclass(IntPtr hwnd, SubclassProc proc, UIntPtr id);
@@ -94,6 +117,17 @@ public sealed partial class MainWindow : Window
     public MainWindow(int startPage = -1)
     {
         InitializeComponent();
+        // Windows 10's XAML renderer fails (0xc000027b, E_UNEXPECTED in Microsoft.UI.Xaml.dll) when
+        // its first frame runs the PNG codec. The two marks are therefore decoded here, on the thread
+        // pool, and reach the images as pixels; Windows 11 keeps the BitmapImage the XAML declares
+        // and never takes this branch.
+        bool windowsTen = RunsWindowsTen();
+        if (windowsTen)
+        {
+            LogoImage.Source = null;
+            AboutLogo.Source = null;
+            LoadMarksAsPixels();
+        }
         PopulateLanguagePicker();
         Title = App.WindowTitle;
         Loc.Localize(RootGrid);
@@ -190,6 +224,30 @@ public sealed partial class MainWindow : Window
         SelectPage(page);
         _ = ConnectAndLoadAsync();
         _ = CheckForUpdatesAsync(); // once per settings window; no resident polling
+    }
+
+    // Windows 10 only (see the top of the constructor). The codec runs here rather than in the first
+    // frame; a SoftwareBitmapSource hands the renderer pixels it only has to upload.
+    private async void LoadMarksAsPixels()
+    {
+        try
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "Assets", "atrium-256.png");
+            var bytes = await File.ReadAllBytesAsync(path);
+            var stream = new InMemoryRandomAccessStream();
+            await stream.WriteAsync(bytes.AsBuffer());
+            stream.Seek(0);
+            var decoder = await BitmapDecoder.CreateAsync(stream);
+            var pixels = await decoder.GetSoftwareBitmapAsync(BitmapPixelFormat.Bgra8, BitmapAlphaMode.Premultiplied);
+            var mark = new SoftwareBitmapSource();
+            await mark.SetBitmapAsync(pixels);
+            LogoImage.Source = mark;
+            AboutLogo.Source = mark;
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine("mark unreadable: " + e);
+        }
     }
 
     // A language switch builds the new settings window while this one is
