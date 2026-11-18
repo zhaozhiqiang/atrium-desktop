@@ -42,6 +42,19 @@ namespace atrium {
 
 namespace {
 
+// Windows 11 hands back the unplated icon in its own taskbar, Start and lists; Windows 10 hands
+// back a Store tile there, which the package's manifest logo replaces.
+bool WindowsEleven()
+{
+    static const bool eleven = [] {
+        using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+        OSVERSIONINFOW v{sizeof(v)};
+        auto get = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+        return get && get(&v) == 0 && v.dwBuildNumber >= 22000;
+    }();
+    return eleven;
+}
+
 constexpr UINT_PTR kTimerId = 0xA701;     // >= 0xA700: clear of the host's own timers
 constexpr UINT kCoalesceMs = 30;
 constexpr UINT kWindowIconTimeoutMs = 100; // WM_GETICON on a possibly hung window
@@ -1421,19 +1434,6 @@ struct TaskModel::Impl {
         PostMessageW(ui, readyMsg, 0, 0);
     }
 
-// Windows 11 shows unplated icons in its own taskbar and Start, so the shell already hands back
-// the right icon there; Windows 10 hands back a Store tile, which the manifest pipeline replaces.
-bool WindowsEleven()
-{
-    static const bool eleven = [] {
-        using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
-        OSVERSIONINFOW v{sizeof(v)};
-        auto get = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
-        return get && get(&v) == 0 && v.dwBuildNumber >= 22000;
-    }();
-    return eleven;
-}
-
 void RunIconJob(const Job& job)
     {
         std::vector<std::wstring> sources;
@@ -2311,6 +2311,22 @@ bool LoadPackagedIcon(const std::wstring& aumid, const std::wstring& exePath, in
         return false;
     Unplate(raw);
     out = FitToSquare(TrimInk(raw), sizePx);
+    return true;
+}
+
+// The icon of an Apps folder item ("<AUMID>", no shell: prefix), for the Start menu and Stage
+// Manager: Windows 10's shell hands back the Store tile, so the package's own logo is used and
+// the tile is keyed out; Windows 11's shell already returns the unplated icon.
+bool LoadAppIcon(const std::wstring& aumid, int sizePx, IconImage& out)
+{
+    if (!WindowsEleven() && LoadPackagedIcon(aumid, L"", sizePx, out))
+        return true;
+    if (!LoadShellImage(L"shell:AppsFolder\\" + aumid, sizePx, out))
+        return false;
+    if (!WindowsEleven()) {
+        Unplate(out);
+        out = FitToSquare(TrimInk(out), sizePx);
+    }
     return true;
 }
 

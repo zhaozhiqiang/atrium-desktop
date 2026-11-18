@@ -577,7 +577,10 @@ void AppCatalog::Worker()
             continue;
         }
         IconImage img;
-        LoadShellImage(IsPath(job.first) ? job.first : L"shell:AppsFolder\\" + job.first, job.second, img);
+        if (IsPath(job.first))
+            LoadShellImage(job.first, job.second, img);
+        else
+            LoadAppIcon(job.first, job.second, img);
         {
             std::lock_guard g(mutex_);
             requested_.erase(job);

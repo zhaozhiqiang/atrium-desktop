@@ -45,6 +45,9 @@ struct TaskItem {
 // thread. COM must be initialised on the calling thread.
 // thumbnail: the picture itself (an image file) rather than its icon.
 bool LoadShellImage(const std::wstring& parsingName, int sizePx, IconImage& out, bool thumbnail = false);
+// The icon of an Apps folder item ("<AUMID>", no shell: prefix) for lists of apps: the package's
+// own logo on Windows 10, whose shell hands back a Store tile, and the shell's icon elsewhere.
+bool LoadAppIcon(const std::wstring& aumid, int sizePx, IconImage& out);
 // Atrium's own programs (Atrium.exe, Atrium.Settings.exe): their icon read from the file
 // itself, not from the shell's icon cache or Explorer's tray snapshot, which keep the icon an
 // earlier build had at the same path. False for any other program.
